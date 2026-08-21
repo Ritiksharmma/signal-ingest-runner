@@ -1,0 +1,70 @@
+# The 06:00 digest send — RFC §16 Phase 3, §14: "the single highest-leverage
+# habit mechanism available." Runs here for the same reason ingest.yml does:
+# my-website is private and metered, this repo is public and free.
+#
+# 06:00 AEST is 20:00 UTC the day before — Brisbane is UTC+10 year-round, so
+# this is a fixed offset rather than a timezone lookup, the same fact
+# my-website's own filing windows rely on.
+#
+# Skips rather than failing when the mail secrets aren't set. A check that is
+# red every day until an email account exists is a check nobody reads by the
+# day it means something — the same reasoning ingest.yml's own database check
+# already makes.
+
+name: Signal digest
+
+on:
+  schedule:
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build and print the digest without sending it"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CI: true
+      SIGNAL_DATABASE_URL: ${{ secrets.SIGNAL_DATABASE_URL }}
+      SIGNAL_EMAIL_PROVIDER: ${{ secrets.SIGNAL_EMAIL_PROVIDER }}
+      SIGNAL_EMAIL_API_KEY: ${{ secrets.SIGNAL_EMAIL_API_KEY }}
+      SIGNAL_DIGEST_TO: ${{ secrets.SIGNAL_DIGEST_TO }}
+      SIGNAL_DIGEST_FROM: ${{ secrets.SIGNAL_DIGEST_FROM }}
+    steps:
+      - name: Checkout my-website (private)
+        uses: actions/checkout@v6
+        with:
+          repository: Ritiksharmma/my-website
+          token: ${{ secrets.MY_WEBSITE_PAT }}
+
+      - name: Check mail is configured
+        id: configured
+        run: |
+          if [ -z "${SIGNAL_DATABASE_URL}" ] || [ -z "${SIGNAL_EMAIL_API_KEY}" ] || [ -z "${SIGNAL_DIGEST_TO}" ]; then
+            echo "database, mail provider, or recipient not yet configured; skipping" >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node
+        if: steps.configured.outputs.ready == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.configured.outputs.ready == 'true'
+        run: npm ci
+
+      - name: Send the digest
+        if: steps.configured.outputs.ready == 'true'
+        run: npm run signal:send-digest ${{ inputs.dry-run && '-- --dry-run' || '' }}
