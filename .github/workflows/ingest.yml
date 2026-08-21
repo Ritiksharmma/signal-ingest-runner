@@ -1,0 +1,95 @@
+# Signal ingest — runs here because this repo is public.
+#
+# my-website is private, so GitHub Actions minutes there are metered, not
+# free. This repo holds no Signal code of its own: it checks my-website out
+# with a read-only, repo-scoped token and runs the exact commands
+# my-website's own `.github/workflows/signal-ingest.yml` used to run, against
+# the same SIGNAL_DATABASE_URL. Minutes here are free because the *workflow*
+# lives in a public repo — what it checks out staying private doesn't affect
+# that.
+#
+# Keep this file's steps in sync with my-website's `signal:migrate` /
+# `signal:ingest` scripts if those ever change shape. See my-website's
+# docs/signal/PHASE-1.md and .github/workflows/signal-ingest.yml for the full
+# design history and why each step exists.
+
+name: Signal ingest
+
+on:
+  schedule:
+    # Every 15 minutes. The windows decide what gets published, not the cron
+    # — see resolveFilingWindow in my-website.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Run the pipeline without publishing a filing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel a run in flight — it may be inside the filing transaction.
+  group: signal-ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      CI: true
+      SIGNAL_DATABASE_URL: ${{ secrets.SIGNAL_DATABASE_URL }}
+      SIGNAL_EMBEDDER: sentence
+      SIGNAL_MODEL_CACHE_DIR: ${{ github.workspace }}/.cache/signal-transformers
+    steps:
+      # Cross-repo checkout: this workflow lives here, but the code it runs
+      # lives in the private my-website repo. MY_WEBSITE_PAT is a
+      # fine-grained PAT scoped to Contents: Read on my-website only.
+      - name: Checkout my-website (private)
+        uses: actions/checkout@v6
+        with:
+          repository: Ritiksharmma/my-website
+          token: ${{ secrets.MY_WEBSITE_PAT }}
+
+      - name: Check the database is configured
+        id: configured
+        run: |
+          if [ -z "${SIGNAL_DATABASE_URL}" ]; then
+            echo "no SIGNAL_DATABASE_URL secret; skipping the run" >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node
+        if: steps.configured.outputs.ready == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.configured.outputs.ready == 'true'
+        run: npm ci
+
+      - name: Apply the schema
+        if: steps.configured.outputs.ready == 'true'
+        run: npm run signal:migrate
+
+      - name: Cache sentence model weights
+        if: steps.configured.outputs.ready == 'true'
+        uses: actions/cache@v5
+        with:
+          path: .cache/signal-transformers
+          key: signal-minilm-l6-v2-${{ runner.os }}-v1
+
+      - name: Install sentence model runtime
+        if: steps.configured.outputs.ready == 'true'
+        run: npm install --no-save @huggingface/transformers@4.2.0
+
+      - name: Run ingest
+        if: steps.configured.outputs.ready == 'true'
+        run: npm run signal:ingest ${{ inputs.dry-run && '-- --dry-run' || '' }}
