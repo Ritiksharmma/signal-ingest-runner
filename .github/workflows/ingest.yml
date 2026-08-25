@@ -38,12 +38,25 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # Was 12. Actions history showed roughly half of all scheduled runs
+    # killed at almost exactly 12m18s with the ingest script mid-run and
+    # silent — not crashing, just not finished. 25 gives real runs enough
+    # room; a run that is still going at 25 minutes is a hang worth seeing
+    # fail loudly rather than a false negative disguised as a race against
+    # the clock.
+    timeout-minutes: 25
     env:
       CI: true
       SIGNAL_DATABASE_URL: ${{ secrets.SIGNAL_DATABASE_URL }}
       SIGNAL_EMBEDDER: sentence
       SIGNAL_MODEL_CACHE_DIR: ${{ github.workspace }}/.cache/signal-transformers
+      # RFC §16 Phase 1.5. Both secrets must be set on this repo (Settings →
+      # Secrets and variables → Actions) for synthesis to actually run —
+      # unset, signal:ingest reads the same absence every other provider
+      # seam does and files with synthesis_depth: 'none', exactly as before
+      # either secret existed.
+      SIGNAL_SYNTHESIS_PROVIDER: ${{ secrets.SIGNAL_SYNTHESIS_PROVIDER }}
+      SIGNAL_SYNTHESIS_API_KEY: ${{ secrets.SIGNAL_SYNTHESIS_API_KEY }}
     steps:
       # Cross-repo checkout: this workflow lives here, but the code it runs
       # lives in the private my-website repo. MY_WEBSITE_PAT is a
