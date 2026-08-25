@@ -22,6 +22,7 @@ and data it touches stay exactly where they were.
 |---|---|---|
 | `MY_WEBSITE_PAT` | Fine-grained PAT, `my-website` only, Contents: Read-only | Used solely for `actions/checkout` against the private repo. Rotate before it expires. |
 | `SIGNAL_DATABASE_URL` | Same Neon connection string as `my-website`'s own secret of the same name | Same database, same schema, same everything — this job is not a fork of Signal's data, it's the same ingest running from a different Actions billing context. |
+| `SIGNAL_SYNTHESIS_PROVIDER`, `SIGNAL_SYNTHESIS_API_KEY` | Optional — RFC §16 Phase 1.5 | Unset, `signal:ingest` files with `synthesis_depth: 'none'`, exactly as before either secret existed. Set both to actually generate synthesis; see `my-website`'s `docs/signal/HANDOFF.md` §1 for which vendor is wired and the terms-of-service reasoning behind using it here. |
 
 ## Why this exists instead of just making my-website public
 
