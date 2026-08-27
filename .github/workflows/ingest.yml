@@ -17,8 +17,10 @@ name: Signal ingest
 
 on:
   schedule:
-    # Every 15 minutes. The windows decide what gets published, not the cron
-    # — see resolveFilingWindow in my-website.
+    # Every 15 minutes — nominally. GitHub throttles `schedule` far harder
+    # than this implies (see the "Run ingest" step for the measurements), so
+    # this is a request rather than a guarantee, and the job below no longer
+    # depends on it being honoured.
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
@@ -32,19 +34,20 @@ permissions:
 
 concurrency:
   # Never cancel a run in flight — it may be inside the filing transaction.
+  # With the multi-pass job below this also does useful work: a dispatch that
+  # arrives while a job is still running queues behind it instead of
+  # overlapping, so consecutive jobs chain into continuous coverage.
   group: signal-ingest
   cancel-in-progress: false
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    # Was 12. Actions history showed roughly half of all scheduled runs
-    # killed at almost exactly 12m18s with the ingest script mid-run and
-    # silent — not crashing, just not finished. 25 gives real runs enough
-    # room; a run that is still going at 25 minutes is a hang worth seeing
-    # fail loudly rather than a false negative disguised as a race against
-    # the clock.
-    timeout-minutes: 25
+    # 60, because the job is now a ~50-minute loop rather than a single pass
+    # (see "Run ingest"). The old 25 was sized for one pass; the ceiling that
+    # actually matters now is that the job ends with room to spare so the
+    # next dispatch is never blocked by a job that outlived its own hour.
+    timeout-minutes: 60
     env:
       CI: true
       SIGNAL_DATABASE_URL: ${{ secrets.SIGNAL_DATABASE_URL }}
@@ -57,6 +60,9 @@ jobs:
       # either secret existed.
       SIGNAL_SYNTHESIS_PROVIDER: ${{ secrets.SIGNAL_SYNTHESIS_PROVIDER }}
       SIGNAL_SYNTHESIS_API_KEY: ${{ secrets.SIGNAL_SYNTHESIS_API_KEY }}
+      # Optional. Overrides the model `pipeline/synthesis.ts` defaults to, so
+      # a vendor quota change is a secret edit rather than a deploy.
+      SIGNAL_SYNTHESIS_MODEL: ${{ secrets.SIGNAL_SYNTHESIS_MODEL }}
     steps:
       # Cross-repo checkout: this workflow lives here, but the code it runs
       # lives in the private my-website repo. MY_WEBSITE_PAT is a
@@ -103,6 +109,59 @@ jobs:
         if: steps.configured.outputs.ready == 'true'
         run: npm install --no-save @huggingface/transformers@4.2.0
 
+      # One dispatch, many passes.
+      #
+      # The cron above says every 15 minutes. GitHub does not honour it:
+      # measured across 29 consecutive scheduled firings on 2026-08-25/26,
+      # the real gaps were min 21m, median 49m, max 184m. That was survivable
+      # while D11 filed three times a day. It is not survivable now that D11
+      # is hourly (my-website v3.7.0) — a three-hour hole swallows three
+      # windows whole, and the reader sees a brief that has not moved.
+      #
+      # So the job stops depending on the trigger's frequency and supplies
+      # its own: it loops for ~50 minutes, running ingest every
+      # INGEST_INTERVAL_MINUTES (15), which is the cadence the RFC specified
+      # all along. One throttled dispatch now covers its whole hour, and the
+      # concurrency group means the next dispatch queues rather than
+      # overlaps, so consecutive jobs chain rather than collide.
+      #
+      # Most passes publish nothing — that is the design (§14: an arrival
+      # moment, not a stream). Only the first pass after an hour turns over
+      # finds a window due and files it.
+      #
+      # A single failed pass does not fail the job: a Neon cold start or a
+      # transient feed error should not cost the remaining 45 minutes of
+      # coverage. A job where *every* pass failed does fail, loudly — the
+      # whole point of the last week's work was that silent failure is worse
+      # than a red run.
       - name: Run ingest
         if: steps.configured.outputs.ready == 'true'
-        run: npm run signal:ingest ${{ inputs.dry-run && '-- --dry-run' || '' }}
+        run: |
+          set -u
+          deadline=$(( SECONDS + 50 * 60 ))
+          pass=0
+          ok=0
+          failed=0
+
+          while :; do
+            pass=$(( pass + 1 ))
+            echo "::group::ingest pass ${pass}"
+            if npm run signal:ingest ${{ inputs.dry-run && '-- --dry-run' || '' }}; then
+              ok=$(( ok + 1 ))
+            else
+              failed=$(( failed + 1 ))
+              echo "pass ${pass} failed; continuing so the rest of the hour is still covered"
+            fi
+            echo "::endgroup::"
+
+            [ "${SECONDS}" -ge "${deadline}" ] && break
+            sleep 900
+          done
+
+          echo "${pass} pass(es): ${ok} ok, ${failed} failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "[ingest] ${pass} pass(es): ${ok} ok, ${failed} failed"
+
+          if [ "${ok}" -eq 0 ]; then
+            echo "::error::every ingest pass in this job failed"
+            exit 1
+          fi
