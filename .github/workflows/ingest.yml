@@ -17,13 +17,31 @@ name: Signal ingest
 
 on:
   schedule:
-    # Every 15 minutes. The windows decide what gets published, not the cron
-    # — see resolveFilingWindow in my-website.
+    # Every 15 minutes, deliberately OFF the quarter-hour. The windows
+    # decide what gets published, not the cron — see resolveFilingWindow in
+    # my-website.
     #
     # GitHub throttles this hard: measured across 29 consecutive firings on
     # 2026-08-25/26, the real gaps were min 21m, median 49m, max 184m. That
     # is the platform's ceiling on a free scheduled trigger and this file
     # cannot raise it.
+    #
+    # It can, however, stop asking for the worst minutes. GitHub delays
+    # scheduled runs when the shared scheduler is loaded, and load is
+    # heaviest on round numbers — :00 above all, then :15/:30/:45 — because
+    # that is where every hand-written cron in the world points. `*/15` asked
+    # for all four. On 2026-08-28 the last scheduled run landed at 00:20Z and
+    # the next had still not fired 2h21m later, leaving the brief stuck at
+    # 10:11 AEST while two windows passed; a manual dispatch filed 12:00
+    # within three minutes, so the runner was healthy and the *trigger* was
+    # the thing missing. 7/22/37/52 keeps the same four-per-hour cadence and
+    # asks for minutes almost nobody else wants.
+    #
+    # This is a mitigation, not a fix. The only way to actually guarantee an
+    # hourly filing on a free plan is to stop relying on `schedule` at all
+    # and drive `workflow_dispatch` from an external scheduler — dispatch
+    # events are not throttled. That needs an account this repo does not
+    # have; see my-website's docs/signal/HANDOFF.md.
     #
     # It was raised the wrong way once, on 2026-08-27, by making the job
     # loop internally for 50 minutes so one dispatch would cover its whole
@@ -35,7 +53,7 @@ on:
     # with the brief sitting nine hours stale. Short jobs and frequent
     # dispatches beat long jobs and rare ones, because the dispatch is the
     # scarce thing.
-    - cron: "*/15 * * * *"
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       dry-run:
