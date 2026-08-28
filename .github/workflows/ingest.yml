@@ -17,10 +17,24 @@ name: Signal ingest
 
 on:
   schedule:
-    # Every 15 minutes — nominally. GitHub throttles `schedule` far harder
-    # than this implies (see the "Run ingest" step for the measurements), so
-    # this is a request rather than a guarantee, and the job below no longer
-    # depends on it being honoured.
+    # Every 15 minutes. The windows decide what gets published, not the cron
+    # — see resolveFilingWindow in my-website.
+    #
+    # GitHub throttles this hard: measured across 29 consecutive firings on
+    # 2026-08-25/26, the real gaps were min 21m, median 49m, max 184m. That
+    # is the platform's ceiling on a free scheduled trigger and this file
+    # cannot raise it.
+    #
+    # It was raised the wrong way once, on 2026-08-27, by making the job
+    # loop internally for 50 minutes so one dispatch would cover its whole
+    # hour. That backfired badly enough to be worth recording here so nobody
+    # tries it again: a job that runs for an hour holds the concurrency
+    # group below for an hour, GitHub keeps at most one pending run per
+    # group and discards the rest, and the result was three runs in
+    # twenty-two hours instead of twenty-five — a fifth of the coverage,
+    # with the brief sitting nine hours stale. Short jobs and frequent
+    # dispatches beat long jobs and rare ones, because the dispatch is the
+    # scarce thing.
     - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
@@ -34,20 +48,26 @@ permissions:
 
 concurrency:
   # Never cancel a run in flight — it may be inside the filing transaction.
-  # With the multi-pass job below this also does useful work: a dispatch that
-  # arrives while a job is still running queues behind it instead of
-  # overlapping, so consecutive jobs chain into continuous coverage.
+  # This is safe precisely because the job is short: a 1-3 minute run almost
+  # never has a dispatch land on top of it, so the group is essentially
+  # uncontended. Keep it that way.
   group: signal-ingest
   cancel-in-progress: false
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    # 60, because the job is now a ~50-minute loop rather than a single pass
-    # (see "Run ingest"). The old 25 was sized for one pass; the ceiling that
-    # actually matters now is that the job ends with room to spare so the
-    # next dispatch is never blocked by a job that outlived its own hour.
-    timeout-minutes: 60
+    # Was 12. Actions history showed roughly half of all scheduled runs
+    # killed at almost exactly 12m18s with the ingest script mid-run and
+    # silent — not crashing, just not finished. 25 gives real runs enough
+    # room; a run that is still going at 25 minutes is a hang worth seeing
+    # fail loudly rather than a false negative disguised as a race against
+    # the clock.
+    #
+    # A normal run is 1-3 minutes. If this number ever needs to grow past
+    # 25 again, the thing to fix is whatever got slow, not this ceiling —
+    # and never by keeping the job alive on purpose (see the cron comment).
+    timeout-minutes: 25
     env:
       CI: true
       SIGNAL_DATABASE_URL: ${{ secrets.SIGNAL_DATABASE_URL }}
@@ -109,59 +129,9 @@ jobs:
         if: steps.configured.outputs.ready == 'true'
         run: npm install --no-save @huggingface/transformers@4.2.0
 
-      # One dispatch, many passes.
-      #
-      # The cron above says every 15 minutes. GitHub does not honour it:
-      # measured across 29 consecutive scheduled firings on 2026-08-25/26,
-      # the real gaps were min 21m, median 49m, max 184m. That was survivable
-      # while D11 filed three times a day. It is not survivable now that D11
-      # is hourly (my-website v3.7.0) — a three-hour hole swallows three
-      # windows whole, and the reader sees a brief that has not moved.
-      #
-      # So the job stops depending on the trigger's frequency and supplies
-      # its own: it loops for ~50 minutes, running ingest every
-      # INGEST_INTERVAL_MINUTES (15), which is the cadence the RFC specified
-      # all along. One throttled dispatch now covers its whole hour, and the
-      # concurrency group means the next dispatch queues rather than
-      # overlaps, so consecutive jobs chain rather than collide.
-      #
-      # Most passes publish nothing — that is the design (§14: an arrival
-      # moment, not a stream). Only the first pass after an hour turns over
-      # finds a window due and files it.
-      #
-      # A single failed pass does not fail the job: a Neon cold start or a
-      # transient feed error should not cost the remaining 45 minutes of
-      # coverage. A job where *every* pass failed does fail, loudly — the
-      # whole point of the last week's work was that silent failure is worse
-      # than a red run.
+      # One pass, and out. The window decides whether it publishes; most
+      # runs publish nothing, which is the design (§14: an arrival moment,
+      # not a stream).
       - name: Run ingest
         if: steps.configured.outputs.ready == 'true'
-        run: |
-          set -u
-          deadline=$(( SECONDS + 50 * 60 ))
-          pass=0
-          ok=0
-          failed=0
-
-          while :; do
-            pass=$(( pass + 1 ))
-            echo "::group::ingest pass ${pass}"
-            if npm run signal:ingest ${{ inputs.dry-run && '-- --dry-run' || '' }}; then
-              ok=$(( ok + 1 ))
-            else
-              failed=$(( failed + 1 ))
-              echo "pass ${pass} failed; continuing so the rest of the hour is still covered"
-            fi
-            echo "::endgroup::"
-
-            [ "${SECONDS}" -ge "${deadline}" ] && break
-            sleep 900
-          done
-
-          echo "${pass} pass(es): ${ok} ok, ${failed} failed" >> "$GITHUB_STEP_SUMMARY"
-          echo "[ingest] ${pass} pass(es): ${ok} ok, ${failed} failed"
-
-          if [ "${ok}" -eq 0 ]; then
-            echo "::error::every ingest pass in this job failed"
-            exit 1
-          fi
+        run: npm run signal:ingest ${{ inputs.dry-run && '-- --dry-run' || '' }}
