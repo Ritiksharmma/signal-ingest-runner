@@ -1,0 +1,53 @@
+# Keepalive for this repo's own schedule.
+#
+# GitHub disables scheduled workflows in a public repo after 60 days with no
+# repository activity, and the ingest schedule in ingest.yml is the only thing
+# that keeps Signal filing. A run of ingest.yml is not "activity"; a commit is.
+# my-website's signal-keepalive.yml commits to my-website, not here, so it
+# never protected this schedule. This one commits here, weekly.
+
+name: Keepalive
+
+on:
+  schedule:
+    # Weekly, well inside the 60-day window, off the top of the hour.
+    - cron: "37 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Record the heartbeat
+        run: |
+          {
+            echo "# Scheduler heartbeat"
+            echo
+            echo "Written weekly by .github/workflows/keepalive.yml so GitHub never"
+            echo "disables this repo's ingest schedule for inactivity (60 days)."
+            echo
+            echo "Last heartbeat: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > KEEPALIVE.md
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add KEEPALIVE.md
+          if git diff --cached --quiet; then
+            echo "nothing to commit" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "chore: weekly scheduler keepalive"
+          git push
